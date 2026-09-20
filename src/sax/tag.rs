@@ -13,6 +13,7 @@ pub struct Tag {
     pub close_end: [u64; 2],
     pub header: (usize, usize),
     pub byte_range: (u64, u64),
+    pub pending_name: bool,
 }
 
 impl Tag {
@@ -29,6 +30,7 @@ impl Tag {
             close_start: [0; 2],
             close_end: [0; 2],
             byte_range: (0, 0),
+            pending_name: false,
         }
     }
 

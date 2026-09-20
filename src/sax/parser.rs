@@ -41,6 +41,14 @@ pub trait EventHandler {
     fn handle_event(&self, event: Event, data: Entity);
 }
 
+struct CheckpointEventHandler;
+
+impl EventHandler for CheckpointEventHandler {
+    fn handle_event(&self, _event: Event, _data: Entity) {}
+}
+
+static CHECKPOINT_EVENT_HANDLER: CheckpointEventHandler = CheckpointEventHandler;
+
 /// Represents a SAX (Simple API for XML) parser.
 ///
 /// This struct provides functionality to parse XML data using the SAX approach,
@@ -68,33 +76,35 @@ pub trait EventHandler {
 pub struct SAXParser<'a> {
     // Configuration and State
     pub events: [bool; 10],
-    state: State,
-    brace_ct: u32,
-    quote: u8,
+    pub(crate) state: State,
+    pub(crate) brace_ct: u32,
+    pub(crate) quote: u8,
+    pub(crate) open_tag_start_dispatched: bool,
 
     // Event Handling
-    event_handler: &'a dyn EventHandler,
+    pub(crate) event_handler: &'a dyn EventHandler,
     // Used to make sure dispatched objects
     // stick around until the next write
-    dispatched: Vec<Dispatched>,
+    pub(crate) dispatched: Vec<Dispatched>,
 
     // Parsing Buffers
-    tags: Vec<Tag>,
-    text: Option<Text>,
-    markup_decl: Option<Text>,
-    markup_entity: Option<Text>,
+    pub(crate) tags: Vec<Tag>,
+    pub(crate) text: Option<Text>,
+    pub(crate) markup_decl: Option<Text>,
+    pub(crate) markup_entity: Option<Text>,
 
-    proc_inst: Option<ProcInst>,
-    attribute: Attribute,
-    tag: Tag,
-    close_tag: Text,
-    fragment: Vec<u8>,
+    pub(crate) proc_inst: Option<ProcInst>,
+    pub(crate) attribute: Attribute,
+    pub(crate) tag: Tag,
+    pub(crate) close_tag: Text,
+    pub(crate) fragment: Vec<u8>,
 
     // Position Tracking
-    end_pos: [u64; 2],
-    source_ptr: *const u8,
-    end_offset: usize,
-    chunk_offset: u64,
+    pub(crate) end_pos: [u64; 2],
+    pub(crate) source_ptr: *const u8,
+    pub(crate) end_offset: usize,
+    pub(crate) chunk_offset: u64,
+    pub(crate) consumed_offset: u64,
 }
 
 impl<'a> SAXParser<'a> {
@@ -155,6 +165,7 @@ impl<'a> SAXParser<'a> {
             state: State::Begin,
             brace_ct: 0,
             quote: 0,
+            open_tag_start_dispatched: false,
 
             // Event Handling
             event_handler,
@@ -177,6 +188,7 @@ impl<'a> SAXParser<'a> {
             end_offset: 0,
             source_ptr: ptr::null(),
             chunk_offset: 0,
+            consumed_offset: 0,
         }
     }
 
@@ -261,6 +273,7 @@ impl<'a> SAXParser<'a> {
 
         self.hydrate();
         self.chunk_offset += source.len() as u64;
+        self.consumed_offset = self.chunk_offset.saturating_sub(self.fragment.len() as u64);
     }
 
     fn hydrate(&mut self) {
@@ -336,6 +349,7 @@ impl<'a> SAXParser<'a> {
         self.state = State::Begin;
         self.brace_ct = 0;
         self.quote = 0;
+        self.open_tag_start_dispatched = false;
 
         // Reset Event Handling
         self.dispatched.clear();
@@ -357,6 +371,91 @@ impl<'a> SAXParser<'a> {
         self.end_offset = 0;
         self.source_ptr = ptr::null();
         self.chunk_offset = 0;
+        self.consumed_offset = 0;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn set_event_handler(&mut self, event_handler: &'a dyn EventHandler) {
+        self.event_handler = event_handler;
+    }
+
+    pub(crate) fn clone_without_handler(&self) -> SAXParser<'static> {
+        SAXParser {
+            events: self.events,
+            state: self.state,
+            brace_ct: self.brace_ct,
+            quote: self.quote,
+            open_tag_start_dispatched: self.open_tag_start_dispatched,
+            event_handler: &CHECKPOINT_EVENT_HANDLER,
+            dispatched: Vec::new(),
+            tags: self.tags.clone(),
+            text: self.text.clone(),
+            markup_decl: self.markup_decl.clone(),
+            markup_entity: self.markup_entity.clone(),
+            proc_inst: self.proc_inst.clone(),
+            attribute: self.attribute.clone(),
+            tag: self.tag.clone(),
+            close_tag: self.close_tag.clone(),
+            fragment: self.fragment.clone(),
+            end_pos: self.end_pos,
+            source_ptr: ptr::null(),
+            end_offset: self.end_offset,
+            chunk_offset: self.chunk_offset,
+            consumed_offset: self.consumed_offset,
+        }
+    }
+
+    pub(crate) fn freeze_for_checkpoint(&mut self) {
+        self.source_ptr = ptr::null();
+        self.dispatched.clear();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_checkpoint(
+        events: u32,
+        consumed_offset: u64,
+        end_pos: [u64; 2],
+        state: State,
+        brace_ct: u32,
+        quote: u8,
+        open_tag_start_dispatched: bool,
+        fragment: Vec<u8>,
+        text: Option<Text>,
+        markup_decl: Option<Text>,
+        markup_entity: Option<Text>,
+        close_tag: Text,
+        attribute: Attribute,
+        proc_inst: Option<ProcInst>,
+        tag: Tag,
+        tags: Vec<Tag>,
+    ) -> SAXParser<'static> {
+        let mut parser_events = [false; 10];
+        for index in 0..10 {
+            parser_events[index] = events & (1 << index) != 0;
+        }
+        SAXParser {
+            events: parser_events,
+            state,
+            brace_ct,
+            quote,
+            open_tag_start_dispatched,
+            event_handler: &CHECKPOINT_EVENT_HANDLER,
+            dispatched: Vec::new(),
+            tags,
+            text,
+            markup_decl,
+            markup_entity,
+            proc_inst,
+            attribute,
+            tag,
+            close_tag,
+            fragment,
+            end_pos,
+            source_ptr: ptr::null(),
+            end_offset: 0,
+            chunk_offset: consumed_offset,
+            consumed_offset,
+        }
     }
 
     /// Processes a grapheme cluster.
@@ -532,13 +631,14 @@ impl<'a> SAXParser<'a> {
             }
         }
 
-        if self.events[Event::OpenTagStart] {
+        if self.events[Event::OpenTagStart] && !self.open_tag_start_dispatched {
             let mut tag = Box::new(self.tag.clone());
             tag.hydrate(self.source_ptr);
 
             self.event_handler.handle_event(Event::OpenTagStart, Entity::Tag(&*tag));
             self.dispatched.push(Dispatched::Tag(tag));
         }
+        self.open_tag_start_dispatched = true;
 
         match byte {
             b'>' => self.process_open_tag(false, gc),
@@ -1115,6 +1215,7 @@ impl<'a> SAXParser<'a> {
     }
 
     fn process_open_tag(&mut self, self_closing: bool, gc: &mut GraphemeClusters) {
+        self.open_tag_start_dispatched = false;
         let mut tag = mem::replace(&mut self.tag, Tag::new([0, 0]));
         tag.self_closing = self_closing;
         tag.open_end = [gc.line, gc.character];
@@ -1259,8 +1360,8 @@ impl IndexMut<Event> for [bool; 10] {
         unsafe { self.get_unchecked_mut(event as usize) }
     }
 }
-#[derive(PartialEq)]
-enum State {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum State {
     // leading byte order mark or whitespace
     Begin = 0,
     // leading whitespace
@@ -1309,6 +1410,23 @@ enum State {
     JSXAttributeExpression = 30,
     // \n       <
     SkipWhitespace = 31,
+}
+
+impl State {
+    pub(crate) fn from_checkpoint_code(code: u8) -> Option<State> {
+        match code {
+            0 => Some(State::Begin), 1 => Some(State::BeginWhitespace), 2 => Some(State::Text),
+            3 => Some(State::LT), 4 => Some(State::MarkupDecl), 5 => Some(State::Entity),
+            6 => Some(State::Doctype), 7 => Some(State::DoctypeEntity), 8 => Some(State::Comment),
+            15 => Some(State::Cdata), 16 => Some(State::ProcInst), 17 => Some(State::ProcInstValue),
+            20 => Some(State::OpenTag), 21 => Some(State::OpenTagSlash), 22 => Some(State::Attrib),
+            23 => Some(State::AttribName), 24 => Some(State::AttribNameSawWhite),
+            25 => Some(State::AttribValue), 26 => Some(State::AttribValueQuoted),
+            27 => Some(State::AttribValueClosed), 28 => Some(State::AttribValueUnquoted),
+            29 => Some(State::CloseTag), 30 => Some(State::JSXAttributeExpression),
+            31 => Some(State::SkipWhitespace), _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

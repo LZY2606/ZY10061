@@ -426,6 +426,30 @@ Constructs a new SAXParser instance with the specified events bitmask.
 
 - `write(chunk: Uint8Array): void` – Writes the supplied bytes to the WASM memory buffer and kicks off processing. **NOTE:** The `line` and `character` counters are not reset between writes.
 
+### Checkpoint and resume
+
+`checkpoint()` returns a deterministic, self-contained `Uint8Array`. It captures the parser phase, open-tag stack, incomplete UTF-8 bytes and tokens, quote/brace state, event mask, and the number of source bytes already consumed. The bytes contain no WASM linear-memory addresses and can be stored or transferred to another process or worker.
+
+```js
+const first = new SAXParser(SaxEventType.CloseTag | SaxEventType.Text);
+await first.prepareWasm(wasmBytes);
+
+first.write(prefix);
+const snapshot = first.checkpoint();
+const consumed = first.consumedByteOffset;
+
+// Restart in another process/worker, then continue from the next byte.
+const resumed = new SAXParser();
+await resumed.prepareWasm(wasmBytes);
+resumed.resume(snapshot, { consumedByteOffset: consumed });
+resumed.write(suffix);
+resumed.end();
+```
+
+`resume(checkpoint, { consumedByteOffset })` validates the magic, format version, parser options/event mask, quote/brace state, and consumed offset before replacing parser state. Validation failure throws and leaves the current parser unchanged. Checkpoint bytes generated from the same state are byte-for-byte identical.
+
+Compatibility: checkpoint format version `1` is supported by the current v3.x runtime. Future incompatible formats will bump the version and document migration behavior.
+
 - `end(): void` – Ends processing for the stream. The `line` and `character` counters are reset to zero and the parser is readied for the next document.
 
 ### Properties

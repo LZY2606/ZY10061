@@ -1,4 +1,5 @@
 use super::utils::{ascii_contains, grapheme_len};
+#[cfg(target_arch = "wasm32")]
 use core::arch::wasm32::{i8x16_bitmask, i8x16_eq, i8x16_splat, v128_load, v128_or};
 use std::{mem, ptr};
 
@@ -286,6 +287,7 @@ impl GraphemeClusters<'_> {
         let max_index = self.byte_len;
         let ptr = self.bytes.as_ptr();
 
+        #[cfg(target_arch = "wasm32")]
         unsafe {
             // Fast path: scan 16 bytes at a time for non-whitespace. Whitespace set
             // matches the ASCII characters the parser expects: space, tab, CR, NL.

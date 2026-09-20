@@ -401,9 +401,17 @@ export declare class Tag extends Reader<TagDetail> implements TagDetail {
 interface WasmSaxParser extends WebAssembly.Exports {
     memory: WebAssembly.Memory;
     parser: (events: number) => void;
-    write: (pointer: number, length: number) => void;
+    write: (pointer: number, length: number) => bigint;
     end: () => void;
+    allocate: (length: number) => number;
+    deallocate: (pointer: number, length: number) => void;
+    checkpoint: () => number;
+    checkpoint_length: () => number;
+    resume: (pointer: number, length: number, events: number, consumedOffsetLow: number, consumedOffsetHigh: number) => number;
 }
+export type ResumeOptions = {
+    readonly consumedByteOffset: number;
+};
 type TextDecoder = {
     decode: (input?: ArrayBufferView | ArrayBuffer, options?: {
         stream?: boolean;
@@ -414,6 +422,7 @@ export declare class SAXParser {
     events?: number;
     wasmSaxParser?: WasmSaxParser;
     eventHandler?: <T extends SaxEvent>(type: T[0], detail: T[1]) => void;
+    consumedByteOffset: number;
     private createDetailConstructor;
     private eventConstructors;
     private writeBuffer?;
@@ -516,7 +525,7 @@ export declare class SAXParser {
      * })();
      * ```
      */
-    write(chunk: Uint8Array): void;
+    write(chunk: Uint8Array): number;
     /**
      * Ends the parsing process.
      *
@@ -524,6 +533,18 @@ export declare class SAXParser {
      * the WASM binary to flush buffers and normalize.
      */
     end(): void;
+    /**
+     * Returns a deterministic, self-contained snapshot of the parser state.
+     *
+     * The returned bytes are portable across processes and workers and do not
+     * contain pointers into this WebAssembly instance.
+     */
+    checkpoint(): Uint8Array;
+    /**
+     * Restores parser state from a checkpoint and continues after the number of
+     * bytes already consumed by the producer.
+     */
+    resume(checkpointBytes: Uint8Array, options: ResumeOptions): void;
     /**
      * Prepares the WebAssembly module for the SAX parser.
      *

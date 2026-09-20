@@ -534,9 +534,39 @@ export class Tag extends Reader<TagDetail> implements TagDetail {
 interface WasmSaxParser extends WebAssembly.Exports {
   memory: WebAssembly.Memory;
   parser: (events: number) => void;
-  write: (pointer: number, length: number) => void;
+  write: (pointer: number, length: number) => bigint;
   end: () => void;
+  allocate: (length: number) => number;
+  deallocate: (pointer: number, length: number) => void;
+  checkpoint: () => number;
+  checkpoint_length: () => number;
+  resume: (
+    pointer: number,
+    length: number,
+    events: number,
+    consumedOffsetLow: number,
+    consumedOffsetHigh: number
+  ) => number;
 }
+
+export type ResumeOptions = {
+  readonly consumedByteOffset: number;
+}
+
+const CHECKPOINT_MAGIC = 'SAXWCKPT';
+const CHECKPOINT_VERSION = 1;
+const CHECKPOINT_MAGIC_BYTES = [0x53, 0x41, 0x58, 0x57, 0x43, 0x4b, 0x50, 0x54];
+const CHECKPOINT_ERROR_MESSAGES: Record<number, string> = {
+  1: 'Invalid checkpoint magic value.',
+  2: `Unsupported checkpoint format version. Expected version ${CHECKPOINT_VERSION}.`,
+  3: 'Truncated or trailing checkpoint data.',
+  4: 'Invalid checkpoint data length.',
+  5: 'Checkpoint event mask does not match the parser configuration.',
+  6: 'Invalid parser state in checkpoint.',
+  7: 'Invalid attribute quote in checkpoint.',
+  8: 'Checkpoint consumed byte offset does not match the requested offset.',
+  9: 'Invalid partial UTF-8 sequence in checkpoint.',
+};
 
 type TextDecoder = {
   decode: (
@@ -551,6 +581,7 @@ export class SAXParser {
   public wasmSaxParser?: WasmSaxParser;
 
   public eventHandler?: <T extends SaxEvent>(type: T[0], detail: T[1]) => void;
+  public consumedByteOffset = 0;
 
   private createDetailConstructor<T extends { new(...args: unknown[]): {}; LENGTH: number }>(Constructor: T) {
     return (memoryBuffer: ArrayBuffer, ptr: number): Reader => {
@@ -712,9 +743,9 @@ export class SAXParser {
    * })();
    * ```
    */
-  public write(chunk: Uint8Array): void {
+  public write(chunk: Uint8Array): number {
     if (!this.wasmSaxParser) {
-      return;
+      return this.consumedByteOffset;
     }
 
     const { write, memory: { buffer } } = this.wasmSaxParser;
@@ -731,7 +762,9 @@ export class SAXParser {
       this.writeBuffer = new Uint8Array(buffer);
     }
     this.writeBuffer.set(chunk, 4);
-    write(4, chunk.byteLength);
+    const consumedOffset = write(4, chunk.byteLength);
+    this.consumedByteOffset = Number(consumedOffset);
+    return this.consumedByteOffset;
   }
 
   /**
@@ -742,7 +775,78 @@ export class SAXParser {
    */
   public end(): void {
     this.writeBuffer = undefined;
+    this.consumedByteOffset = 0;
     this.wasmSaxParser?.end();
+  }
+
+  /**
+   * Returns a deterministic, self-contained snapshot of the parser state.
+   *
+   * The returned bytes are portable across processes and workers and do not
+   * contain pointers into this WebAssembly instance.
+   */
+  public checkpoint(): Uint8Array {
+    if (!this.wasmSaxParser) {
+      throw new Error('Prepare the WebAssembly parser before creating a checkpoint.');
+    }
+    const pointer = this.wasmSaxParser.checkpoint();
+    if (pointer >= 0x8000_0000) {
+      throw new Error(CHECKPOINT_ERROR_MESSAGES[pointer & 0x7fff_ffff] ?? 'Unable to create a checkpoint.');
+    }
+    const length = this.wasmSaxParser.checkpoint_length();
+    return new Uint8Array(this.wasmSaxParser.memory.buffer.slice(pointer, pointer + length));
+  }
+
+  /**
+   * Restores parser state from a checkpoint and continues after the number of
+   * bytes already consumed by the producer.
+   */
+  public resume(checkpointBytes: Uint8Array, options: ResumeOptions): void {
+    if (!this.wasmSaxParser) {
+      throw new Error('Prepare the WebAssembly parser before resuming a checkpoint.');
+    }
+    if (!(checkpointBytes instanceof Uint8Array)) {
+      throw new TypeError('Checkpoint must be a Uint8Array.');
+    }
+    if (!Number.isSafeInteger(options.consumedByteOffset) || options.consumedByteOffset < 0) {
+      throw new RangeError('consumedByteOffset must be a non-negative safe integer.');
+    }
+    if (checkpointBytes.byteLength < CHECKPOINT_MAGIC.length + 4) {
+      throw new Error(CHECKPOINT_ERROR_MESSAGES[3]);
+    }
+    const hasValidMagic = CHECKPOINT_MAGIC_BYTES
+      .every((byte, index) => checkpointBytes[index] === byte);
+    if (!hasValidMagic) {
+      throw new Error(CHECKPOINT_ERROR_MESSAGES[1]);
+    }
+    if (checkpointBytes[CHECKPOINT_MAGIC.length] !== CHECKPOINT_VERSION) {
+      throw new Error(CHECKPOINT_ERROR_MESSAGES[2]);
+    }
+
+    const { allocate, deallocate, memory, resume } = this.wasmSaxParser;
+    const length = checkpointBytes.byteLength;
+    const pointer = allocate(length);
+    if (pointer === 0) {
+      throw new Error('Unable to allocate WebAssembly memory for the checkpoint.');
+    }
+    try {
+      new Uint8Array(memory.buffer).set(checkpointBytes, pointer);
+      const consumedOffset = BigInt(options.consumedByteOffset);
+      const result = resume(
+        pointer,
+        length,
+        this.events ?? 0,
+        Number(consumedOffset & 0xffff_ffffn),
+        Number(consumedOffset >> 32n)
+      );
+      if (result !== 0) {
+        throw new Error(CHECKPOINT_ERROR_MESSAGES[result] ?? `Unable to resume checkpoint (${result}).`);
+      }
+    } finally {
+      deallocate(pointer, length);
+    }
+    this.writeBuffer = undefined;
+    this.consumedByteOffset = options.consumedByteOffset;
   }
 
   /**
