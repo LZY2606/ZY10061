@@ -95,6 +95,7 @@ pub struct SAXParser<'a> {
     source_ptr: *const u8,
     end_offset: usize,
     chunk_offset: u64,
+    consumed_bytes: u64,
 }
 
 impl<'a> SAXParser<'a> {
@@ -177,6 +178,7 @@ impl<'a> SAXParser<'a> {
             end_offset: 0,
             source_ptr: ptr::null(),
             chunk_offset: 0,
+            consumed_bytes: 0,
         }
     }
 
@@ -232,7 +234,12 @@ impl<'a> SAXParser<'a> {
         self.dispatched.clear();
         let mut bytes = source;
 
+        // Total logical stream bytes handed to the parser so far. Incomplete
+        // UTF-8 sequences from the previous write are retained in `fragment`
+        // and prepended to this chunk; they must not be counted again.
+        let supplied_before = self.consumed_bytes;
         let frag_len = self.fragment.len();
+        let write_base = self.chunk_offset;
         let mut vec = Vec::new();
         if frag_len != 0 {
             let frag = mem::take(&mut self.fragment);
@@ -245,22 +252,37 @@ impl<'a> SAXParser<'a> {
         self.source_ptr = bytes.as_ptr();
 
         let mut gc = GraphemeClusters::new(bytes);
+        gc.fragment_len = frag_len;
         gc.line = self.end_pos[0];
         gc.character = self.end_pos[1];
+        // Absolute stream offset of the first byte in `bytes`.
+        self.chunk_offset = write_base;
 
-        while let Some(current) = gc.next() {
+        while !gc.next_is_incomplete() {
+            let Some(current) = gc.next() else {
+                break;
+            };
             self.process_grapheme(&mut gc, &current);
         }
 
         self.end_pos = [gc.line, gc.character];
         self.end_offset = gc.cursor;
 
+        let mut retained = 0usize;
         if let Some(fragment) = gc.get_remaining_bytes() {
+            retained = fragment.len();
             self.fragment.extend_from_slice(fragment);
         }
 
         self.hydrate();
-        self.chunk_offset += source.len() as u64;
+        // Absolute offset of the first byte of this write's input in the
+        // logical stream, plus everything consumed out of it.
+        self.chunk_offset = write_base + gc.cursor as u64;
+        self.consumed_bytes = supplied_before + source.len() as u64;
+        debug_assert_eq!(
+            self.chunk_offset as usize + retained,
+            self.consumed_bytes as usize
+        );
     }
 
     fn hydrate(&mut self) {
@@ -287,6 +309,55 @@ impl<'a> SAXParser<'a> {
         }
 
         self.tag.hydrate(ptr);
+    }
+
+    /// Captures the pointer-free structural state used to build a checkpoint.
+    ///
+    /// Safe to call only when no write is in progress; after `write` returns
+    /// every borrowed source slice has been drained by `hydrate`.
+    pub(crate) fn snapshot(&self) -> super::checkpoint::ParserSnapshot<'_> {
+        super::checkpoint::ParserSnapshot {
+            events: self.events,
+            state: self.state,
+            brace_ct: self.brace_ct,
+            quote: self.quote,
+            tags: &self.tags,
+            text: self.text.as_ref(),
+            markup_decl: self.markup_decl.as_ref(),
+            markup_entity: self.markup_entity.as_ref(),
+            proc_inst: self.proc_inst.as_ref(),
+            attribute: &self.attribute,
+            tag: &self.tag,
+            close_tag: self.close_tag.clone(),
+            fragment: &self.fragment,
+            end_pos: self.end_pos,
+            consumed: self.consumed_bytes,
+        }
+    }
+
+    /// Replaces this parser's state with validated checkpoint contents.
+    #[allow(dead_code)] // invoked through the WebAssembly FFI boundary
+    pub(crate) fn restore_checkpoint(&mut self, data: super::checkpoint::CheckpointData) {
+        let fragment_len = data.fragment.len() as u64;
+        self.events = data.events;
+        self.state = data.state;
+        self.brace_ct = data.brace_ct as u32;
+        self.quote = data.quote;
+        self.dispatched.clear();
+        self.tags = data.tags;
+        self.text = data.text;
+        self.markup_decl = data.markup_decl;
+        self.markup_entity = data.markup_entity;
+        self.proc_inst = data.proc_inst;
+        self.attribute = data.attribute;
+        self.tag = data.tag;
+        self.close_tag = data.close_tag;
+        self.fragment = data.fragment;
+        self.end_pos = data.end_pos;
+        self.end_offset = 0;
+        self.source_ptr = ptr::null();
+        self.chunk_offset = data.consumed - fragment_len;
+        self.consumed_bytes = data.consumed;
     }
 
     /// Resets the parser to its initial state.
@@ -357,6 +428,7 @@ impl<'a> SAXParser<'a> {
         self.end_offset = 0;
         self.source_ptr = ptr::null();
         self.chunk_offset = 0;
+        self.consumed_bytes = 0;
     }
 
     /// Processes a grapheme cluster.
@@ -433,12 +505,17 @@ impl<'a> SAXParser<'a> {
         }
 
         if byte == b'<' {
-            self.tag = Tag::new([gc.line, gc.last_character]);
+            // Record the absolute position of the `<` itself.
+            self.tag = Tag::new([gc.last_line, gc.last_character]);
+            self.tag.byte_range.0 = self.chunk_offset + gc.last_cursor_pos as u64;
             self.state = State::LT;
             return;
         }
 
         self.new_text(gc.line, gc.last_character, gc.last_cursor_pos);
+        // Continue processing the current grapheme as text so multi-byte
+        // characters and regular content both enter the pending text node.
+        self.text(gc, current);
     }
 
     fn less_than(&mut self, gc: &mut GraphemeClusters, current: &[u8]) {
@@ -456,7 +533,10 @@ impl<'a> SAXParser<'a> {
                 // the stack, we need to flush_text
                 // now to prevent text nodes from
                 // being added to the wrong tag
-                self.flush_text(gc.line, character, offset);
+                // The end of the text is the previously scanned boundary,
+                // which correctly spans multi-byte graphemes unlike a
+                // cursor-derived single-byte backstep.
+                self.flush_text_before_tag(gc);
                 self.open_tag(gc, current);
             }
 
@@ -511,13 +591,14 @@ impl<'a> SAXParser<'a> {
         }
 
         if should_flush_text && self.text.is_some() {
-            self.flush_text(gc.line, character, offset);
+            self.flush_text_before_tag(gc);
         }
     }
 
     fn open_tag(&mut self, gc: &mut GraphemeClusters, current: &[u8]) {
-        self.tag.open_start = [gc.line, gc.character.saturating_sub(2)];
-        self.tag.byte_range.0 = (self.chunk_offset + gc.cursor as u64).saturating_sub(2);
+        // open_start and byte_range.0 were pinned to the `<` when it was
+        // consumed in less_than()/begin_white_space(), so they stay valid
+        // even when the name arrives in a later write.
         let mut byte = current[0];
         if !ascii_contains(TAG_NAME_END, byte) {
             if let Some((span, found)) = gc.take_until_one_found(TAG_NAME_END, true) {
@@ -584,6 +665,10 @@ impl<'a> SAXParser<'a> {
         // if less_than() determines this not to be a real
         // tag, the text will continue without flushing
         if byte == b'<' {
+            // Pin the tag start to this `<` for the case where markup opens
+            // directly inside a text or JSX expression scan.
+            self.tag = Tag::new([gc.last_line, gc.last_character]);
+            self.tag.byte_range.0 = self.chunk_offset + gc.last_cursor_pos as u64;
             self.state = State::LT;
             return;
         }
@@ -621,6 +706,48 @@ impl<'a> SAXParser<'a> {
             self.tags[len - 1].text_nodes.push(*text.clone());
         }
 
+        if self.events[Event::Text] && text.hydrate(self.source_ptr) {
+            self.event_handler.handle_event(Event::Text, Entity::Text(&text));
+            self.dispatched.push(Dispatched::Text(text));
+        }
+    }
+
+    /// Flushes pending text when a new tag begins, using the text node's own
+    /// scanned boundary. That boundary was set while consuming the preceding
+    /// content and is accurate when the last grapheme spans several bytes.
+    fn flush_text_before_tag(&mut self, gc: &mut GraphemeClusters) {
+        let Some(text) = self.text.as_mut() else {
+            return;
+        };
+        let absolute_end = text.byte_range.1;
+        let absolute_start = text.byte_range.0;
+        let end_line = text.start[0];
+        // No newlines are inside the text node, so the closing character is
+        // start character + number of characters in the text. Fall back to
+        // the grapheme iterator's backed-up position.
+        let end_character = gc.character.saturating_sub(2);
+        let mut text = Box::new(unsafe { self.text.take().unwrap_unchecked() });
+        text.end = [end_line, end_character];
+        text.byte_range.1 = absolute_end;
+        // Resolve the source slice from absolute stream offsets into the
+        // current write's local coordinates so `hydrate` can drain it.
+        if absolute_start >= self.chunk_offset {
+            let local_start = (absolute_start - self.chunk_offset) as usize;
+            let local_end = (absolute_end - self.chunk_offset) as usize;
+            text.header = (local_start, local_end);
+            text.hydrate(self.source_ptr);
+            text.header = (0, 0);
+        }
+        if text.header.0 == text.header.1 && text.value.is_empty()
+            || (absolute_start == absolute_end && text.value.is_empty())
+        {
+            return;
+        }
+
+        let len = self.tags.len();
+        if len != 0 && self.events[Event::CloseTag] {
+            self.tags[len - 1].text_nodes.push(*text.clone());
+        }
         if self.events[Event::Text] && text.hydrate(self.source_ptr) {
             self.event_handler.handle_event(Event::Text, Entity::Text(&text));
             self.dispatched.push(Dispatched::Text(text));
@@ -1084,7 +1211,7 @@ impl<'a> SAXParser<'a> {
                 attr_end = found;
             }
             self.attribute.value.header.1 = gc.cursor;
-            self.attribute.value.byte_range.1 = gc.cursor as u64;
+            self.attribute.value.byte_range.1 = self.chunk_offset + gc.cursor as u64;
             self.attribute.value.end = [gc.line, gc.character];
 
             if !attr_end && current[0] != byte {
@@ -1203,11 +1330,15 @@ impl<'a> SAXParser<'a> {
         if self.brace_ct == 0 {
             self.attribute.value.end = [gc.line, gc.character.saturating_sub(1)];
             self.attribute.value.header.1 = gc.last_cursor_pos;
+            self.attribute.value.byte_range.1 = self.chunk_offset + gc.last_cursor_pos as u64;
             self.process_attribute(gc);
             self.state = State::AttribValueClosed;
             return;
         }
         gc.take_until_one_found(&[b'{', b'}'], false);
+        let end_cursor = gc.cursor;
+        self.attribute.value.header.1 = end_cursor;
+        self.attribute.value.byte_range.1 = self.chunk_offset + end_cursor as u64;
     }
 
     fn new_text(&mut self, line: u64, character: u64, offset: usize) {
@@ -1221,7 +1352,7 @@ impl<'a> SAXParser<'a> {
         self.state = State::Text;
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     // 1
     Text = 0,
@@ -1259,8 +1390,9 @@ impl IndexMut<Event> for [bool; 10] {
         unsafe { self.get_unchecked_mut(event as usize) }
     }
 }
-#[derive(PartialEq)]
-enum State {
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum State {
     // leading byte order mark or whitespace
     Begin = 0,
     // leading whitespace
@@ -2284,5 +2416,51 @@ the plugin
         assert_eq!(attr.value.end, [0, 0]);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_multibyte_split_at_every_byte() {
+        // Text containing a 4-byte emoji must produce the same single text
+        // event no matter where the input is split across writes.
+        let whole = "<div>\u{1F680}</div>".as_bytes();
+        for cut in 0..=whole.len() {
+            let event_handler = TextEventHandler::new();
+            let mut sax = SAXParser::new(&event_handler);
+            let mut events = [false; 10];
+            events[Event::Text] = true;
+            events[Event::CloseTag] = true;
+            sax.events = events;
+            sax.write(&whole[..cut]);
+            sax.write(&whole[cut..]);
+            sax.identity();
+
+            let texts = event_handler.texts.borrow();
+            assert_eq!(texts.len(), 1, "cut {cut}: expected one text event");
+            assert_eq!(
+                texts[0].value,
+                "\u{1F680}".as_bytes(),
+                "cut {cut}: emoji reconstructed"
+            );
+            assert_eq!(texts[0].byte_range, (5, 9), "cut {cut}: byte range");
+        }
+    }
+
+    #[test]
+    fn test_cdata_split_at_every_byte() {
+        let whole = "<x><![CDATA[data </not-tag> \u{1F680} ]]></x>".as_bytes();
+        for cut in 0..=whole.len() {
+            let event_handler = TextEventHandler::new();
+            let mut sax = SAXParser::new(&event_handler);
+            let mut events = [false; 10];
+            events[Event::Cdata] = true;
+            events[Event::CloseTag] = true;
+            sax.events = events;
+            sax.write(&whole[..cut]);
+            sax.write(&whole[cut..]);
+            sax.identity();
+            let texts = event_handler.texts.borrow();
+            assert_eq!(texts.len(), 1, "cut {cut}: one cdata event");
+            assert_eq!(texts[0].end, [0, 34], "cut {cut}: cdata end {:?}", texts[0].end);
+        }
     }
 }

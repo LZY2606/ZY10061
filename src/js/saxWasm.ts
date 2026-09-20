@@ -536,6 +536,43 @@ interface WasmSaxParser extends WebAssembly.Exports {
   parser: (events: number) => void;
   write: (pointer: number, length: number) => void;
   end: () => void;
+  save_checkpoint: () => number;
+  checkpoint_ptr: () => number;
+  restore_checkpoint: (
+    pointer: number,
+    length: number,
+    events: number,
+    expectedConsumedPtr: number
+  ) => number;
+}
+
+/** On-disk checkpoint format produced by this build. */
+export const CHECKPOINT_VERSION = 1;
+/** Fixed length, in bytes, of the checkpoint header. */
+export const CHECKPOINT_HEADER_LENGTH = 42;
+
+/** Numeric validation codes returned by the WebAssembly restore export. */
+export const enum CheckpointErrorCode {
+  InvalidMagic = -1,
+  UnsupportedVersion = -2,
+  Truncated = -3,
+  UnsupportedOptions = -4,
+  InvalidState = -5,
+  InvalidAttrType = -6,
+  EventMaskMismatch = -7,
+  ConsumedOffsetMismatch = -8,
+}
+
+/**
+ * Error thrown when a checkpoint cannot be produced or restored. A failed
+ * restore never modifies the current parser state.
+ */
+export class CheckpointError extends Error {
+  constructor(message: string, public readonly code?: number) {
+    super(message);
+    this.name = 'CheckpointError';
+    Object.setPrototypeOf(this, CheckpointError.prototype);
+  }
 }
 
 type TextDecoder = {
@@ -746,6 +783,90 @@ export class SAXParser {
   }
 
   /**
+   * Produces a portable, deterministic snapshot of the parser's structural
+   * state. The returned bytes contain no references to the current WebAssembly
+   * linear memory and can be stored (disk, object storage, another worker) and
+   * handed to {@link SAXParser.resume} in any later process.
+   *
+   * Call this only between `write` calls - never from inside an event handler.
+   *
+   * @returns An owned `Uint8Array` copy of the checkpoint bytes.
+   */
+  public getCheckpoint(): Uint8Array {
+    const wasm = this.wasmSaxParser;
+    if (!wasm) {
+      throw new CheckpointError('Cannot create a checkpoint before the WebAssembly parser is prepared.');
+    }
+    const length = wasm.save_checkpoint();
+    const pointer = wasm.checkpoint_ptr();
+    // Copy out immediately: future writes or a second checkpoint can move
+    // and overwrite the module-owned buffer.
+    return new Uint8Array(wasm.memory.buffer, pointer, length).slice();
+  }
+
+  /**
+   * Restores parser state from a checkpoint produced by
+   * {@link SAXParser.getCheckpoint}. After a successful resume, continue
+   * feeding bytes starting immediately after the consumed offset reported by
+   * {@link SAXParser.readCheckpointConsumedBytes}.
+   *
+   * The checkpoint's format version, parse options and event mask must match
+   * this parser. When `expectedConsumedBytes` is provided it must also match
+   * the checkpoint's own counter. Any mismatch throws a {@link CheckpointError}
+   * and leaves the current parser completely untouched.
+   *
+   * @param checkpoint Bytes previously returned by `getCheckpoint`.
+   * @param expectedConsumedBytes Optional stream offset the caller believes
+   *        has already been handed to the parser.
+   * @returns The number of consumed bytes recorded by the checkpoint.
+   */
+  public resume(checkpoint: Uint8Array, expectedConsumedBytes?: number): number {
+    const wasm = this.wasmSaxParser;
+    if (!wasm) {
+      throw new CheckpointError('Cannot resume before the WebAssembly parser is prepared.');
+    }
+    // Pre-validate the header from JS so every error message is explicit and
+    // no parser state is touched on failure.
+    validateCheckpointHeader(checkpoint, ~~this.events, expectedConsumedBytes);
+
+    const { memory } = wasm;
+    const buffer = new Uint8Array(memory.buffer);
+    if (checkpoint.byteLength + 12 > buffer.byteLength) {
+      throw new CheckpointError('Checkpoint is larger than available parser memory.');
+    }
+    // Place the checkpoint and the optional expected-offset counter after
+    // the 4-byte input area used by `write`.
+    const checkpointPointer = 4;
+    const offsetPointer = checkpoint.byteLength + 8;
+    buffer.set(checkpoint, checkpointPointer);
+    new DataView(memory.buffer).setBigUint64(
+      offsetPointer,
+      BigInt(expectedConsumedBytes ?? readCheckpointConsumedBytes(checkpoint)),
+      true
+    );
+
+    const result = wasm.restore_checkpoint(
+      checkpointPointer,
+      checkpoint.byteLength,
+      ~~this.events,
+      expectedConsumedBytes === undefined ? 0 : offsetPointer
+    );
+    if (result !== 0) {
+      throw restoreError(result);
+    }
+    return readCheckpointConsumedBytes(checkpoint);
+  }
+
+  /**
+   * Reads the number of stream bytes already consumed at the checkpoint.
+   * The next chunk written after {@link SAXParser.resume} must begin at this
+   * offset.
+   */
+  public static readCheckpointConsumedBytes(checkpoint: Uint8Array): number {
+    return readCheckpointConsumedBytes(checkpoint);
+  }
+
+  /**
    * Prepares the WebAssembly module for the SAX parser.
    *
    * This function takes a WebAssembly module source (either a `Response` or `Uint8Array`)
@@ -833,6 +954,79 @@ export class SAXParser {
 }
 
 export const readString = (data: Uint8Array, offset: number, length: number): string => SAXParser.textDecoder.decode(data.subarray(offset, offset + length));
+
+const checkpointView = (checkpoint: Uint8Array, offset: number, length: number): DataView => {
+  const view = new DataView(checkpoint.buffer, checkpoint.byteOffset + offset, length);
+  return view;
+};
+
+/**
+ * Reads the consumed-byte counter from a checkpoint without instantiating a
+ * parser or mutating anything.
+ */
+export const readCheckpointConsumedBytes = (checkpoint: Uint8Array): number => {
+  return Number(checkpointView(checkpoint, 9, 8).getBigUint64(0, true));
+};
+
+const restoreErrorMessages: Record<number, string> = {
+  [CheckpointErrorCode.InvalidMagic]: 'Not a sax-wasm checkpoint (bad magic prefix).',
+  [CheckpointErrorCode.UnsupportedVersion]: 'Unsupported checkpoint format version.',
+  [CheckpointErrorCode.Truncated]: 'Checkpoint is truncated or contains trailing bytes.',
+  [CheckpointErrorCode.UnsupportedOptions]: 'Checkpoint uses unsupported parser options.',
+  [CheckpointErrorCode.InvalidState]: 'Checkpoint contains an unknown lexical state.',
+  [CheckpointErrorCode.InvalidAttrType]: 'Checkpoint contains an unknown attribute type.',
+  [CheckpointErrorCode.EventMaskMismatch]: 'Checkpoint event mask does not match this parser.',
+  [CheckpointErrorCode.ConsumedOffsetMismatch]: 'Checkpoint consumed offset does not match the expected value.',
+};
+
+const restoreError = (code: number): CheckpointError =>
+  new CheckpointError(restoreErrorMessages[code] ?? `Checkpoint restore failed with code ${code}.`, code);
+
+/**
+ * Validates everything readable from the fixed header so that a bad
+ * checkpoint rejects before touching WebAssembly state.
+ */
+const validateCheckpointHeader = (
+  checkpoint: Uint8Array,
+  events: number,
+  expectedConsumedBytes?: number
+): void => {
+  if (!(checkpoint instanceof Uint8Array)) {
+    throw new CheckpointError('Checkpoint must be a Uint8Array.');
+  }
+  if (checkpoint.byteLength < CHECKPOINT_HEADER_LENGTH) {
+    throw restoreError(CheckpointErrorCode.Truncated);
+  }
+  for (let i = 0; i < 4; i++) {
+    if (checkpoint[i] !== [0x53, 0x41, 0x58, 0x43][i]) {
+      throw restoreError(CheckpointErrorCode.InvalidMagic);
+    }
+  }
+  const version = checkpoint[4];
+  if (version !== CHECKPOINT_VERSION) {
+    throw new CheckpointError(
+      `Unsupported checkpoint format version ${version}; this build supports version ${CHECKPOINT_VERSION}.`,
+      CheckpointErrorCode.UnsupportedVersion
+    );
+  }
+  const options = checkpointView(checkpoint, 5, 2).getUint16(0, true);
+  if (options !== 0) {
+    throw restoreError(CheckpointErrorCode.UnsupportedOptions);
+  }
+  const mask = checkpointView(checkpoint, 7, 2).getUint16(0, true);
+  if (mask !== (events & 0xffff)) {
+    throw restoreError(CheckpointErrorCode.EventMaskMismatch);
+  }
+  if (expectedConsumedBytes !== undefined) {
+    const consumed = readCheckpointConsumedBytes(checkpoint);
+    if (consumed !== expectedConsumedBytes) {
+      throw new CheckpointError(
+        `Checkpoint consumed offset is ${consumed}, expected ${expectedConsumedBytes}.`,
+        CheckpointErrorCode.ConsumedOffsetMismatch
+      );
+    }
+  }
+};
 
 let cachedDataBuffer: ArrayBuffer | SharedArrayBuffer | null = null;
 let cachedDataView: DataView | null = null;

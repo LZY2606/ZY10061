@@ -375,6 +375,55 @@ Streaming is supported with sax-wasm by writing utf-8 code points (Uint8Array) t
 anywhere except within the `eventHandler` function or within the `eventTrap` (when extending `SAXParser` class).
 Doing so anyway risks overwriting memory still in play.
 
+## Checkpoints and resume
+For multi-gigabyte streams you can persist a checkpoint before a restart or worker recycle and continue from the next byte
+instead of replaying the document from the beginning. A checkpoint captures the full structural parser state: the current
+lexical phase, any incomplete UTF-8 sequence, the open tag stack (including attributes and namespace context), in-flight
+comments/CDATA/doctype/proc-inst buffers, cross-chunk text starts, the JSX brace counter and the event mask. It contains
+plain bytes only - never addresses into WebAssembly linear memory - so a checkpoint produced in one process can be
+restored in another.
+
+```js
+import { readFileSync } from 'node:fs';
+import { SAXParser, SaxEventType } from 'sax-wasm';
+
+const wasm = readFileSync('./node_modules/sax-wasm/lib/sax-wasm.wasm');
+const parser = new SAXParser(SaxEventType.OpenTag | SaxEventType.CloseTag | SaxEventType.Text);
+await parser.prepareWasm(wasm);
+
+// ... feed chunks until a convenient persistence point ...
+const checkpoint = parser.getCheckpoint();
+const consumed = SAXParser.readCheckpointConsumedBytes(checkpoint);
+// Persist `checkpoint` (IndexedDB, disk, object storage, ...) along with `consumed`.
+
+// Later, in the same process or a brand new one:
+const restarted = new SAXParser(SaxEventType.OpenTag | SaxEventType.CloseTag | SaxEventType.Text);
+await restarted.prepareWasm(wasm);
+restarted.eventHandler = (event, detail) => { /* ... */ };
+restarted.resume(checkpoint);
+restarted.write(streamBytes.subarray(consumed)); // continue from the next byte
+```
+
+Events emitted before the checkpoint are never replayed and tokens already in progress (a comment split across the
+boundary, an emoji cut mid-sequence, an open attribute value) are never lost: the continued event stream is identical to
+parsing the whole document in one pass.
+
+`resume()` validates the format version, reserved parser options, event mask and, when supplied, the consumed byte
+offset. Any mismatch throws a `CheckpointError` and leaves the current parser untouched, so you can safely retry.
+Checkpoint bytes are deterministic for identical parser state.
+
+### Checkpoint compatibility
+Checkpoints carry a format version and a reserved parse-options word. The current guarantee is:
+
+- A checkpoint produced by sax-wasm `3.1.x` can be restored by any `3.1.x` build on any runtime/architecture
+  (Node, browsers, workers), independent of the WebAssembly instance or process that created it.
+- The byte layout is stable across patch releases; restoring an older checkpoint is supported while the embedded
+  format version is unchanged. A future incompatible layout bumps that version and `resume()` rejects older bytes with
+  a clear error instead of misinterpreting them.
+- Checkpoints are not a public archival format across major versions: pin the sax-wasm version that reads them, or
+  re-create a checkpoint after upgrading.
+
+
 ## Events
 Events are subscribed to using a bitmask composed from flags representing the event type.
 For example, passing in the following bitmask to the parser instructs it to emit events for Text, OpenTag and Attribute:
@@ -427,6 +476,12 @@ Constructs a new SAXParser instance with the specified events bitmask.
 - `write(chunk: Uint8Array): void` – Writes the supplied bytes to the WASM memory buffer and kicks off processing. **NOTE:** The `line` and `character` counters are not reset between writes.
 
 - `end(): void` – Ends processing for the stream. The `line` and `character` counters are reset to zero and the parser is readied for the next document.
+
+- `getCheckpoint(): Uint8Array` – Returns a deterministic, portable snapshot of the parser state between writes. See [Checkpoints and resume](#checkpoints-and-resume).
+
+- `resume(checkpoint: Uint8Array, expectedConsumedBytes?: number): number` – Restores parser state from a checkpoint and returns the consumed byte offset to continue from. Throws `CheckpointError` without mutating the parser on any validation mismatch.
+
+- `SAXParser.readCheckpointConsumedBytes(checkpoint: Uint8Array): number` – Reads the consumed byte offset from a checkpoint without instantiating a parser.
 
 ### Properties
 

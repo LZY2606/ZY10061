@@ -203,13 +203,27 @@ pub enum Dispatched {
     Text(Box<Text>),
 }
 
-#[derive(Clone, Copy)]
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AttrType {
     NoValue = 0b0000,
     JSX = 0b0001,
     NoQuotes = 0b0010,
     SingleQuoted = 0b0100,
     DoubleQuoted = 0b1000,
+}
+
+impl AttrType {
+    pub fn from_u8(value: u8) -> Option<AttrType> {
+        match value {
+            0b0000 => Some(AttrType::NoValue),
+            0b0001 => Some(AttrType::JSX),
+            0b0010 => Some(AttrType::NoQuotes),
+            0b0100 => Some(AttrType::SingleQuoted),
+            0b1000 => Some(AttrType::DoubleQuoted),
+            _ => None,
+        }
+    }
 }
 
 pub struct Accumulator {

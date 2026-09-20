@@ -21,3 +21,7 @@ codegen-units = 1      # Single codegen unit for better optimization
 panic = "abort"        # Reduce binary size by disabling unwinding
 strip = "symbols"      # Remove debug symbols for smaller binaries
 [target.wasm32-unknown-unknown]
+# Newer Rust toolchains stopped implicitly exporting linear memory, which the
+# JS host relies on (it reads the exported `memory`). Pin the linker behavior
+# here instead of requiring a machine-local .cargo/config.toml.
+rustflags = ["-C", "link-arg=--export-memory", "-C", "link-arg=--no-entry"]

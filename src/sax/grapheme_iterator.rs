@@ -1,4 +1,5 @@
 use super::utils::{ascii_contains, grapheme_len};
+#[cfg(target_arch = "wasm32")]
 use core::arch::wasm32::{i8x16_bitmask, i8x16_eq, i8x16_splat, v128_load, v128_or};
 use std::{mem, ptr};
 
@@ -18,6 +19,10 @@ use std::{mem, ptr};
 pub struct GraphemeClusters<'a> {
     bytes: &'a [u8],
     pub byte_len: usize,
+    /// Bytes prepended from the previous write's incomplete fragment. These
+    /// bytes are part of the buffer but were already accounted for in the
+    /// starting line/character counters.
+    pub fragment_len: usize,
     pub line: u64,
     pub last_line: u64,
     pub character: u64,
@@ -49,6 +54,7 @@ impl GraphemeClusters<'_> {
         GraphemeClusters {
             bytes,
             byte_len: bytes.len(),
+            fragment_len: 0,
             cursor: 0,
             last_cursor_pos: 0,
             line: 0,
@@ -146,7 +152,9 @@ impl GraphemeClusters<'_> {
             return None;
         }
         let ptr = self.bytes.as_ptr();
-        let idx = self.cursor.saturating_sub(1);
+        // Reconsider the previously consumed grapheme: it may be several
+        // bytes long (a 4-byte emoji), so back up to its real start.
+        let idx = self.last_cursor_pos;
         let current_byte = unsafe { *self.bytes.get_unchecked(idx) };
         if ascii_contains(haystack, current_byte) {
             return Some((unsafe { &*ptr::slice_from_raw_parts(ptr.add(idx), 1) }, true));
@@ -154,44 +162,27 @@ impl GraphemeClusters<'_> {
 
         let start = self.cursor;
         let mut cursor = self.cursor;
-        let mut line = self.line;
-        let mut character = self.character;
         let max_index = self.byte_len;
-        let mut matched_byte = b'0';
         let mut found = false;
         let mut len = 0;
 
         while cursor < max_index {
             let next_byte = unsafe { *ptr.add(cursor) };
-
-            if ascii_contains(haystack, next_byte) {
-                found = true;
-                matched_byte = next_byte;
-                len = grapheme_len(next_byte);
+            // Stop before an incomplete UTF-8 sequence at the tail so it is
+            // retained as a fragment instead of partially counted.
+            if self.ends_in_incomplete_seq(cursor) {
                 break;
             }
 
-            len = grapheme_len(next_byte);
-            if next_byte == b'\n' {
-                line += 1;
-                character = 0;
-            } else {
-                character += if len != 4 {
-                    1
-                } else {
-                    2
-                };
+            if ascii_contains(haystack, next_byte) {
+                found = true;
+                len = grapheme_len(next_byte);
+                break;
             }
-            cursor += len;
+            cursor += grapheme_len(next_byte);
         }
 
         if found && include_match {
-            if matched_byte == b'\n' {
-                line += 1;
-                character = 0;
-            } else {
-                character += 1;
-            }
             len = 1;
             cursor += 1;
         }
@@ -199,9 +190,7 @@ impl GraphemeClusters<'_> {
         // We've run out of bytes - deliver what we have
         // even though the ascii wasn't found but do not
         // include a broken surrogate
-        if cursor > max_index {
-            cursor -= len;
-        }
+        cursor = cursor.min(max_index);
 
         // If the slice len is zero, return None
         if start == cursor {
@@ -211,8 +200,16 @@ impl GraphemeClusters<'_> {
         self.cursor = cursor;
         self.last_cursor_pos = cursor - len;
 
-        self.last_line = mem::replace(&mut self.line, line);
-        self.last_character = mem::replace(&mut self.character, character);
+        // The initial counters already include every byte consumed before
+        // this write (and thus the reconstructed fragment prefix). Count
+        // only graphemes newly consumed past the fragment here.
+        let (new_line, new_character) = Self::count_complete_graphemes(
+            &self.bytes[start.max(self.fragment_len)..cursor],
+            self.line,
+            self.character,
+        );
+        self.last_line = mem::replace(&mut self.line, new_line);
+        self.last_character = mem::replace(&mut self.character, new_character);
 
         // Use unsafe slice creation for performance
         Some((unsafe { &*ptr::slice_from_raw_parts(ptr.add(start), cursor - start) }, found))
@@ -226,54 +223,46 @@ impl GraphemeClusters<'_> {
         let max_index = self.byte_len;
         let ptr = self.bytes.as_ptr();
         let mut cursor = self.cursor;
-        let mut line = self.line;
-        let mut character = self.character;
         let mut found = false;
         let mut len = 0;
 
         while cursor < max_index {
             let next_byte = unsafe { *ptr.add(cursor) };
-            len = grapheme_len(next_byte);
+            // Retain incomplete UTF-8 tails for the next write.
+            if self.ends_in_incomplete_seq(cursor) {
+                break;
+            }
 
             if next_byte == match_byte {
                 found = true;
                 break;
             }
-
-            if next_byte == b'\n' {
-                line += 1;
-                character = 0;
-            } else {
-                character += if len != 4 {
-                    1
-                } else {
-                    2
-                };
-            }
-            cursor += len;
+            cursor += grapheme_len(next_byte);
         }
 
-        if include_match_or_exhaust && cursor < max_index {
-            if match_byte == b'\n' {
-                line += 1;
-                character = 0;
-            } else {
-                character += 1;
-            }
+        if include_match_or_exhaust && cursor < max_index && !self.ends_in_incomplete_seq(cursor) {
             len = 1;
             cursor += 1;
         }
         // We've run out of bytes - deliver what we have
         // even though the ascii wasn't found but do not
         // include a broken surrogate
-        if cursor > max_index {
-            cursor -= len;
+        cursor = cursor.min(max_index);
+        // When stopping at a retained sequence, `len` describes the byte that
+        // follows cursor and must not be used to back-track `last_cursor_pos`.
+        if cursor < max_index && self.ends_in_incomplete_seq(cursor) {
+            len = 1;
         }
 
         self.cursor = cursor;
         self.last_cursor_pos = cursor - len;
-        self.last_line = mem::replace(&mut self.line, line);
-        self.last_character = mem::replace(&mut self.character, character);
+        let (new_line, new_character) = Self::count_complete_graphemes(
+            &self.bytes[start.max(self.fragment_len)..cursor],
+            self.line,
+            self.character,
+        );
+        self.last_line = mem::replace(&mut self.line, new_line);
+        self.last_character = mem::replace(&mut self.character, new_character);
 
         Some((unsafe { &*ptr::slice_from_raw_parts(ptr.add(start), cursor - start) }, found))
     }
@@ -286,9 +275,12 @@ impl GraphemeClusters<'_> {
         let max_index = self.byte_len;
         let ptr = self.bytes.as_ptr();
 
+        #[allow(unused_unsafe)]
         unsafe {
             // Fast path: scan 16 bytes at a time for non-whitespace. Whitespace set
             // matches the ASCII characters the parser expects: space, tab, CR, NL.
+            #[cfg(target_arch = "wasm32")]
+            {
             let sp = i8x16_splat(b' ' as i8);
             let tab = i8x16_splat(b'\t' as i8);
             let nl = i8x16_splat(b'\n' as i8);
@@ -341,6 +333,7 @@ impl GraphemeClusters<'_> {
                 done = true;
                 break;
             }
+            }
         }
 
         while cursor < max_index {
@@ -377,6 +370,83 @@ impl GraphemeClusters<'_> {
 
         Some(bytes)
     }
+
+    /// Returns the byte length of the UTF-8 sequence beginning at `cursor`
+    /// when the whole sequence is present, otherwise `None`.
+    ///
+    /// Continuation bytes outside of a valid lead byte are treated as a
+    /// single consumable byte to mirror the parser's lenient one-byte
+    /// fallback in [`grapheme_len`].
+    fn complete_seq_len(&self) -> Option<usize> {
+        let byte = unsafe { *self.bytes.get_unchecked(self.cursor) };
+        let expected = grapheme_len(byte);
+        if expected == 1 {
+            // ASCII is always complete; a stray continuation byte is
+            // consumed on its own like the rest of the parser.
+            return Some(1);
+        }
+        // Validate continuation bytes so a malformed lead is consumed
+        // one byte at a time instead of swallowing unrelated bytes.
+        // The sequence occupies `expected` bytes starting at `cursor`; all
+        // continuation bytes must be present.
+        if self.byte_len - self.cursor < expected {
+            // The sequence runs past the buffer; retain the lead byte so
+            // the complete grapheme is assembled from the next write.
+            return None;
+        }
+        for offset in 1..expected {
+            let index = self.cursor + offset;
+            if unsafe { *self.bytes.get_unchecked(index) } & 0b1100_0000 != 0b1000_0000 {
+                return Some(1);
+            }
+        }
+        Some(expected)
+    }
+
+    /// True when the byte at `offset` is a UTF-8 lead byte whose sequence is
+    /// truncated by the end of the buffer.
+    fn ends_in_incomplete_seq(&self, offset: usize) -> bool {
+        if offset >= self.byte_len {
+            return false;
+        }
+        let byte = unsafe { *self.bytes.get_unchecked(offset) };
+        let len = grapheme_len(byte);
+        byte >= 0xC0 && offset + len > self.byte_len
+    }
+
+    /// True when the next byte is the lead of a UTF-8 sequence that the
+    /// buffer does not fully contain.
+    pub fn next_is_incomplete(&self) -> bool {
+        self.cursor < self.byte_len && self.ends_in_incomplete_seq(self.cursor)
+    }
+
+    /// Recounts `(line, character)` for the consumed prefix `0..cursor`,
+    /// starting from `(start_line, start_character)`. Used at the end of a
+    /// scan so positions never count a retained partial sequence.
+    /// Advances `(line, character)` across the complete graphemes in the
+    /// slice, stopping at any truncated tail.
+    fn count_complete_graphemes(
+        bytes: &[u8],
+        mut line: u64,
+        mut character: u64,
+    ) -> (u64, u64) {
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            let len = grapheme_len(byte);
+            if index + len > bytes.len() {
+                break;
+            }
+            if byte == b'\n' {
+                line += 1;
+                character = 0;
+            } else {
+                character += if len != 4 { 1 } else { 2 };
+            }
+            index += len;
+        }
+        (line, character)
+    }
 }
 /// An iterator for grapheme clusters in an utf-8 formatted string
 ///
@@ -391,17 +461,11 @@ impl<'a> Iterator for GraphemeClusters<'a> {
 
         let cursor = self.cursor;
         let bytes = self.bytes;
-        let byte_len = self.byte_len;
+        let len = self.complete_seq_len()?;
+        let next_byte = unsafe { *bytes.get_unchecked(cursor) };
+        let end = cursor + len;
         let mut line = self.line;
         let mut character = self.character;
-
-        let next_byte = unsafe { *bytes.get_unchecked(cursor) };
-        let len = grapheme_len(next_byte);
-        let end = cursor + len;
-
-        if end > byte_len {
-            return None;
-        }
 
         // Update line and character count
         if next_byte == b'\n' {

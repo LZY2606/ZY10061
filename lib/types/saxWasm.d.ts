@@ -403,6 +403,32 @@ interface WasmSaxParser extends WebAssembly.Exports {
     parser: (events: number) => void;
     write: (pointer: number, length: number) => void;
     end: () => void;
+    save_checkpoint: () => number;
+    checkpoint_ptr: () => number;
+    restore_checkpoint: (pointer: number, length: number, events: number, expectedConsumedPtr: number) => number;
+}
+/** On-disk checkpoint format produced by this build. */
+export declare const CHECKPOINT_VERSION = 1;
+/** Fixed length, in bytes, of the checkpoint header. */
+export declare const CHECKPOINT_HEADER_LENGTH = 42;
+/** Numeric validation codes returned by the WebAssembly restore export. */
+export declare const enum CheckpointErrorCode {
+    InvalidMagic = -1,
+    UnsupportedVersion = -2,
+    Truncated = -3,
+    UnsupportedOptions = -4,
+    InvalidState = -5,
+    InvalidAttrType = -6,
+    EventMaskMismatch = -7,
+    ConsumedOffsetMismatch = -8
+}
+/**
+ * Error thrown when a checkpoint cannot be produced or restored. A failed
+ * restore never modifies the current parser state.
+ */
+export declare class CheckpointError extends Error {
+    readonly code?: number;
+    constructor(message: string, code?: number);
 }
 type TextDecoder = {
     decode: (input?: ArrayBufferView | ArrayBuffer, options?: {
@@ -525,6 +551,40 @@ export declare class SAXParser {
      */
     end(): void;
     /**
+     * Produces a portable, deterministic snapshot of the parser's structural
+     * state. The returned bytes contain no references to the current WebAssembly
+     * linear memory and can be stored (disk, object storage, another worker) and
+     * handed to {@link SAXParser.resume} in any later process.
+     *
+     * Call this only between `write` calls - never from inside an event handler.
+     *
+     * @returns An owned `Uint8Array` copy of the checkpoint bytes.
+     */
+    getCheckpoint(): Uint8Array;
+    /**
+     * Restores parser state from a checkpoint produced by
+     * {@link SAXParser.getCheckpoint}. After a successful resume, continue
+     * feeding bytes starting immediately after the consumed offset reported by
+     * {@link SAXParser.readCheckpointConsumedBytes}.
+     *
+     * The checkpoint's format version, parse options and event mask must match
+     * this parser. When `expectedConsumedBytes` is provided it must also match
+     * the checkpoint's own counter. Any mismatch throws a {@link CheckpointError}
+     * and leaves the current parser completely untouched.
+     *
+     * @param checkpoint Bytes previously returned by `getCheckpoint`.
+     * @param expectedConsumedBytes Optional stream offset the caller believes
+     *        has already been handed to the parser.
+     * @returns The number of consumed bytes recorded by the checkpoint.
+     */
+    resume(checkpoint: Uint8Array, expectedConsumedBytes?: number): number;
+    /**
+     * Reads the number of stream bytes already consumed at the checkpoint.
+     * The next chunk written after {@link SAXParser.resume} must begin at this
+     * offset.
+     */
+    static readCheckpointConsumedBytes(checkpoint: Uint8Array): number;
+    /**
      * Prepares the WebAssembly module for the SAX parser.
      *
      * This function takes a WebAssembly module source (either a `Response` or `Uint8Array`)
@@ -571,6 +631,11 @@ export declare class SAXParser {
     eventTrap: (event: SaxEventType, ptr: number) => void;
 }
 export declare const readString: (data: Uint8Array, offset: number, length: number) => string;
+/**
+ * Reads the consumed-byte counter from a checkpoint without instantiating a
+ * parser or mutating anything.
+ */
+export declare const readCheckpointConsumedBytes: (checkpoint: Uint8Array) => number;
 export declare const readU32: (uint8Array: Uint8Array, ptr: number) => number;
 export declare const readPosition: (uint8Array: Uint8Array, ptr?: number) => Position;
 export {};
