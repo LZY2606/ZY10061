@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "baseUrl": "./src",
+    "module": "ESNext",
+    "target": "esnext",
+    "outDir": "lib",
+    "declaration": false,
+    "esModuleInterop": false,
+    "allowSyntheticDefaultImports": true,
+    "moduleResolution": "Node",
+    "skipLibCheck": true
+  },
+  "lib": [
+    "es2017",
+    "esnext",
+    "node"
+  ],
+  "include": [
+    "src/js/**/*.ts"
+  ],
+  "exclude": [
+    "src/js/**/*.spec.ts"
+  ]
+}

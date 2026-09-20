@@ -1,0 +1,23 @@
+[package]
+name = "sax-wasm"
+version = "0.1.0"
+authors = ["justinwilaby <jwilaby@gmail.com>"]
+edition = "2021"
+description = "A SAX parser implemented in WebAssembly"
+license = "MIT"
+repository = "https://github.com/justinwilaby/sax-wasm"
+keywords = ["sax", "parser", "wasm", "xml"]
+categories = ["wasm", "parser-implementations"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3          # Maximum optimization level
+lto = "fat"            # Enable Link Time Optimization (LTO)
+codegen-units = 1      # Single codegen unit for better optimization
+panic = "abort"        # Reduce binary size by disabling unwinding
+strip = "symbols"      # Remove debug symbols for smaller binaries
+[target.wasm32-unknown-unknown]
